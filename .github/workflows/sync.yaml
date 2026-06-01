@@ -1,0 +1,107 @@
+name: Rebase Upstream
+on:
+  schedule:
+    - cron: '15 */4 * * *' # every 4 hours
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  sync:
+    name: Rebase, build, and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      IMAGE_NAME: ${{ github.repository }}
+      REGISTRY: ghcr.io
+    steps:
+      - name: Get Release Please token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_PLEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_GITHUB_APP_SECRET }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 10
+          token: ${{ steps.app-token.outputs.token }}
+
+      # borrowed from https://github.com/opentofu/scripts/blob/main/.github/workflows/sync.yml
+      - name: Setup upstream
+        run: |
+          parent_owner=$(gh repo view $GITHUB_REPOSITORY --json parent --jq '.parent.owner.login')
+          parent_name=$(gh repo view $GITHUB_REPOSITORY --json parent --jq '.parent.name')
+          parent_repo="https://github.com/${parent_owner}/${parent_name}.git"
+          echo "${parent_repo}"
+          git remote add upstream "${parent_repo}"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Rebase the fault branch
+        run: |
+          git config --global user.email "269297074+colonel-byte-release-please[bot]@users.noreply.github.com"
+          git config --global user.name "colonel-byte-release-please[bot]"
+
+          default_branch=$(git symbolic-ref --short HEAD)
+          git pull --rebase upstream "$default_branch"
+          git push origin "$default_branch" --force
+
+      - name: Fetch tags from upstream
+        run: |
+          git fetch --tags --force upstream
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Get Short SHA
+        id: commit
+        run: |-
+          echo "short=$(echo ${{ github.sha }} | sed -E 's#^(.{12}).+#\1#g')"
+          echo "short=$(echo ${{ github.sha }} | sed -E 's#^(.{12}).+#\1#g')" >> $GITHUB_OUTPUT
+
+          echo "tag=$(git describe --tags --abbrev=0)"
+          echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
+
+      - name: Push tags to origin
+        id: checker
+        run: |-
+          if [[ $(git push --tags origin 2>&1) == "Everything up-to-date" ]]; then
+            echo "push=Everything up-to-date" >> $GITHUB_OUTPUT
+          else
+            echo "push=Everything not up-to-date" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install oras tool
+        if: steps.checker.outputs.push != 'Everything up-to-date'
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+
+      - name: Create zip file
+        if: steps.checker.outputs.push != 'Everything up-to-date'
+        run: |-
+          mkdir -p /home/runner/work/modules
+          zip -r /home/runner/work/modules/module.zip . -x "*.git*"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        if: steps.checker.outputs.push != 'Everything up-to-date'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish Artifact
+        if: steps.checker.outputs.push != 'Everything up-to-date'
+        working-directory: /home/runner/work/modules
+        run: |-
+          oras push ghcr.io/${{ github.repository_owner }}/opentofu-modules/${{ github.event.repository.name }}:latest --artifact-type application/vnd.opentofu.modulepkg module.zip:archive/zip
+
+      - name: Create manifest list and pushes
+        if: steps.checker.outputs.push != 'Everything up-to-date'
+        run: |-
+          oras tag  ghcr.io/${{ github.repository_owner }}/opentofu-modules/${{ github.event.repository.name }}:latest ${{ steps.commit.outputs.short }}
+          oras tag  ghcr.io/${{ github.repository_owner }}/opentofu-modules/${{ github.event.repository.name }}:latest ${{ steps.commit.outputs.tag }}
